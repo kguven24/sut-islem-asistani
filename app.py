@@ -95,20 +95,26 @@ def build_procedure_text(procedures):
 
 # ── Prompt ─────────────────────────────────────────────────────────────────────
 
-def build_prompt(diagnosis, procedures_text, specialty):
-    system = (
-        f"Sen Türk sağlık sisteminde {specialty} uzmanı bir klinisyensin.\n"
-        "Görevin: verilen tanı için aşağıdaki SUT işlem listesinden tıbben uygun işlemleri seçmek.\n\n"
-        "KURALLAR:\n"
-        "1. Sadece kanıta dayalı tıp standartlarına ve tıbbi etiğe uygun işlemleri seç.\n"
-        "2. Yalnızca listede yer alan işlemleri seç — listede olmayan işlem ekleme.\n"
-        "3. Her işlem için 1-2 cümle Türkçe klinik gerekçe yaz.\n"
-        "4. Kontrendike veya gereksiz işlemleri dahil etme.\n"
-        "5. SADECE geçerli JSON döndür, başka metin ekleme:\n"
-        '   {"uygun_islemler": [{"kod": "...", "ad": "...", "gerekce": "..."}]}\n\n'
-        f"SUT İŞLEM LİSTESİ:\n{procedures_text}"
-    )
-    user = f"Tanı: {diagnosis}\n\nBu tanı için SUT listesinden uygun işlemleri belirle."
+def build_prompt(diagnosis, procedures_text, specialty, compact=False):
+    if compact:
+        # Ultra-short for Groq free tier (<6k token budget)
+        system = (
+            f"{specialty} uzmanı. SUT listesinden tanıya uygun işlemleri seç. "
+            "Sadece JSON döndür: "
+            '{"uygun_islemler":[{"kod":"...","ad":"...","gerekce":"..."}]}\n\n'
+            f"SUT:\n{procedures_text}"
+        )
+    else:
+        system = (
+            f"Sen Türk sağlık sisteminde {specialty} uzmanı bir klinisyensin.\n"
+            "Verilen tanı için SUT listesinden tıbben uygun işlemleri seç.\n"
+            "Kanıta dayalı tıp standartlarına uy. Kontrendike işlemleri ekleme.\n"
+            "Her işlem için 1-2 cümle Türkçe klinik gerekçe yaz.\n"
+            "SADECE JSON döndür:\n"
+            '{"uygun_islemler":[{"kod":"...","ad":"...","gerekce":"..."}]}\n\n'
+            f"SUT İŞLEM LİSTESİ:\n{procedures_text}"
+        )
+    user = f"Tanı: {diagnosis}"
     return system, user
 
 
@@ -123,9 +129,9 @@ def _parse_json(raw):
 
 def query_gemini(diagnosis, procedures_text, specialty, api_key):
     genai.configure(api_key=api_key)
-    system, user = build_prompt(diagnosis, procedures_text, specialty)
+    system, user = build_prompt(diagnosis, procedures_text, specialty, compact=False)
     model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash-lite",  # free tier, high quota
+        model_name="gemini-2.0-flash-lite",
         system_instruction=system,
     )
     response = model.generate_content(user)
@@ -133,15 +139,17 @@ def query_gemini(diagnosis, procedures_text, specialty, api_key):
 
 
 def query_groq(diagnosis, procedures_text, specialty, api_key):
-    system, user = build_prompt(diagnosis, procedures_text, specialty)
+    # Use only first 80 procedures + compact prompt to stay under 6k token limit
+    short_text = "\n".join(procedures_text.split("\n")[:80])
+    system, user = build_prompt(diagnosis, short_text, specialty, compact=True)
     client = Groq(api_key=api_key)
     response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",  # 20k TPM free limit vs 6k for 70b
+        model="llama-3.1-8b-instant",
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        max_tokens=4096,
+        max_tokens=2048,
         temperature=0.1,
     )
     return _parse_json(response.choices[0].message.content)
@@ -234,11 +242,20 @@ if search and diagnosis.strip():
     with st.spinner(f"Gemini ve LLaMA paralel taranıyor ({len(filtered)} işlem)…"):
         ai_results = run_both(diagnosis.strip(), proc_text, specialty, gemini_key, groq_key)
 
-    for name, data in ai_results.items():
-        if "error" in data:
-            st.error(f"{name} hatası: {data['error']}")
+    errors = {n: d["error"] for n, d in ai_results.items() if "error" in d}
+    working = {n: d for n, d in ai_results.items() if "error" not in d}
 
-    agreed, single = merge_results(ai_results)
+    for name, err in errors.items():
+        if "429" in str(err) or "quota" in str(err).lower():
+            st.warning(f"⏳ {name}: Günlük ücretsiz kota doldu, gece yarısı sıfırlanır.")
+        else:
+            st.warning(f"⚠️ {name} yanıt vermedi: {str(err)[:120]}")
+
+    if not working:
+        st.error("Her iki model de yanıt veremedi. Lütfen biraz bekleyip tekrar deneyin.")
+        st.stop()
+
+    agreed, single = merge_results(working)
     total = len(agreed) + len(single)
 
     if total == 0:
