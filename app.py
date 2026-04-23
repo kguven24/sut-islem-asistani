@@ -58,26 +58,38 @@ GENERAL_KEYWORDS = [
 ]
 
 
-def prefilter(procedures, specialty):
+def prefilter(procedures, specialty, diagnosis=""):
     spec_kw = SPECIALTY_KEYWORDS.get(specialty, [])
-    result = []
+    # Extract meaningful words from diagnosis for relevance scoring
+    diag_words = [w.upper() for w in re.split(r"[\s,/\-]+", diagnosis) if len(w) > 3]
+
+    scored = []
     for p in procedures:
         sec = p.get("section", "").upper()
         name = p.get("name", "").upper()
+        desc = p.get("description", "").upper()
+
         is_general = any(kw in sec or kw in name for kw in GENERAL_KEYWORDS)
         is_specialty = not spec_kw or any(kw in sec or kw in name for kw in spec_kw)
-        if is_general or is_specialty:
-            result.append(p)
-    return result
+
+        if not (is_general or is_specialty):
+            continue
+
+        # Score by how many diagnosis words appear in procedure name/desc
+        score = sum(1 for w in diag_words if w in name or w in desc or w in sec)
+        scored.append((score, p))
+
+    # Sort: diagnosis-matching first, then general
+    scored.sort(key=lambda x: -x[0])
+    # Cap at 400 procedures to stay within free-tier token limits (~15k tokens)
+    return [p for _, p in scored[:400]]
 
 
 def build_procedure_text(procedures):
     lines = []
     for p in procedures:
-        line = f"[{p['code']}] {p['name']}"
-        if p.get("description"):
-            line += f" — {p['description'][:120]}"
-        lines.append(line)
+        # Omit description to save tokens — code + name is enough for matching
+        lines.append(f"[{p['code']}] {p['name']}")
     return "\n".join(lines)
 
 
@@ -113,7 +125,7 @@ def query_gemini(diagnosis, procedures_text, specialty, api_key):
     genai.configure(api_key=api_key)
     system, user = build_prompt(diagnosis, procedures_text, specialty)
     model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
+        model_name="gemini-1.5-flash",  # higher free-tier quota than 2.0-flash
         system_instruction=system,
     )
     response = model.generate_content(user)
@@ -124,7 +136,7 @@ def query_groq(diagnosis, procedures_text, specialty, api_key):
     system, user = build_prompt(diagnosis, procedures_text, specialty)
     client = Groq(api_key=api_key)
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="llama-3.1-8b-instant",  # 20k TPM free limit vs 6k for 70b
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -216,7 +228,7 @@ search = st.button(
 )
 
 if search and diagnosis.strip():
-    filtered = prefilter(procedures, specialty)
+    filtered = prefilter(procedures, specialty, diagnosis.strip())
     proc_text = build_procedure_text(filtered)
 
     with st.spinner(f"Gemini ve LLaMA paralel taranıyor ({len(filtered)} işlem)…"):
