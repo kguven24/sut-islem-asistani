@@ -81,8 +81,8 @@ def prefilter(procedures, specialty, diagnosis=""):
 
     # Sort: diagnosis-matching first, then general
     scored.sort(key=lambda x: -x[0])
-    # Cap at 400 procedures to stay within free-tier token limits (~15k tokens)
-    return [p for _, p in scored[:400]]
+    # Cap at 150 procedures — keeps total request under 6k tokens (Groq free limit)
+    return [p for _, p in scored[:150]]
 
 
 def build_procedure_text(procedures):
@@ -125,7 +125,7 @@ def query_gemini(diagnosis, procedures_text, specialty, api_key):
     genai.configure(api_key=api_key)
     system, user = build_prompt(diagnosis, procedures_text, specialty)
     model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",  # higher free-tier quota than 2.0-flash
+        model_name="gemini-2.0-flash-lite",  # free tier, high quota
         system_instruction=system,
     )
     response = model.generate_content(user)
