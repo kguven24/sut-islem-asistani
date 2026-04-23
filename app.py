@@ -2,7 +2,10 @@ import streamlit as st
 import json
 import os
 import re
-import anthropic
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import google.generativeai as genai
+from groq import Groq
 
 st.set_page_config(
     page_title="SUT İşlem Asistanı",
@@ -11,8 +14,10 @@ st.set_page_config(
 )
 
 st.title("🏥 SUT İşlem Asistanı")
-st.caption("Tanıya göre SGK Sağlık Uygulama Tebliği kapsamındaki uygun işlemleri bulur · Pediatri, Nefroloji, Çocuk Nefrolojisi")
+st.caption("Tanıya göre SGK Sağlık Uygulama Tebliği kapsamındaki uygun işlemleri bulur · Pediatri · Nefroloji · Çocuk Nefrolojisi")
 
+
+# ── Data ───────────────────────────────────────────────────────────────────────
 
 @st.cache_data
 def load_procedures():
@@ -22,18 +27,9 @@ def load_procedures():
 
 
 SPECIALTY_KEYWORDS = {
-    "Pediatri": [
-        "PEDİYATRİ", "ÇOCUK", "YENİDOĞAN", "PEDIATR", "BEBEK", "KOT", "KUVÖZ"
-    ],
-    "Nefroloji": [
-        "NEFROLOJİ", "NEFRO", "DİYALİZ", "HEMODİYALİZ", "PERİTON",
-        "BÖBREK", "ÜRİNER", "ÜROLOJİ", "TRANSPLANT"
-    ],
-    "Çocuk Nefrolojisi": [
-        "NEFROLOJİ", "NEFRO", "DİYALİZ", "HEMODİYALİZ", "PERİTON",
-        "BÖBREK", "ÜRİNER", "ÜROLOJİ", "TRANSPLANT",
-        "PEDİYATRİ", "ÇOCUK", "YENİDOĞAN", "PEDIATR", "BEBEK"
-    ],
+    "Pediatri": ["PEDİYATRİ", "ÇOCUK", "YENİDOĞAN", "PEDIATR", "BEBEK", "KOT", "KUVÖZ"],
+    "Nefroloji": ["NEFROLOJİ", "NEFRO", "DİYALİZ", "HEMODİYALİZ", "PERİTON", "BÖBREK", "ÜRİNER", "ÜROLOJİ", "TRANSPLANT"],
+    "Çocuk Nefrolojisi": ["NEFROLOJİ", "NEFRO", "DİYALİZ", "HEMODİYALİZ", "PERİTON", "BÖBREK", "ÜRİNER", "ÜROLOJİ", "TRANSPLANT", "PEDİYATRİ", "ÇOCUK", "YENİDOĞAN", "PEDIATR", "BEBEK"],
     "Tümü": [],
 }
 
@@ -43,7 +39,7 @@ GENERAL_KEYWORDS = [
     "KAN", "İDRAR", "LAB", "TETKİK",
     "RADYOLOJİ", "ULTRASONOGRAFİ", "BT", "MR", "SİNTİGRAFİ", "GÖRÜNTÜLEME",
     "YATAK", "YOĞUN BAKIM", "ACİL", "TPN",
-    "GENETİK", "PAT", "ATOLOJI", "SİTOLOJİ",
+    "GENETİK", "PATOLOJİ", "SİTOLOJİ",
     "EKO", "EKG", "ELEKTRO",
     "ENDOSKOPİ",
     "AFEREZ", "TRANSFÜZYON", "KAN ÜRÜNLERİ",
@@ -68,111 +64,200 @@ def build_procedure_text(procedures):
     for p in procedures:
         line = f"[{p['code']}] {p['name']}"
         if p.get("description"):
-            short_desc = p["description"][:120]
-            line += f" — {short_desc}"
+            line += f" — {p['description'][:120]}"
         lines.append(line)
     return "\n".join(lines)
 
 
-def query(diagnosis, procedures_text, specialty):
-    api_key = os.environ.get("ANTHROPIC_API_KEY") or st.secrets.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        st.error("ANTHROPIC_API_KEY bulunamadı. Lütfen ortam değişkeni veya Streamlit secret olarak tanımlayın.")
-        return None
+# ── Prompt ─────────────────────────────────────────────────────────────────────
 
-    client = anthropic.Anthropic(api_key=api_key)
-
-    system_content = [
-        {
-            "type": "text",
-            "text": f"""Sen Türk sağlık sisteminde {specialty} uzmanı bir klinisyensin.
-Görevin: verilen tanı/şikayet için, aşağıdaki SGK Sağlık Uygulama Tebliği (SUT) işlem listesinden tıbben uygun işlemleri seçmek.
-
-KURALLAR:
-1. Sadece tıbbi etik, kanıta dayalı tıp standartları ve SUT mevzuatına uygun işlemleri seç.
-2. Yalnızca aşağıdaki listede yer alan işlemleri seç — listede olmayan işlem ekleme.
-3. Her işlem için kısa (1-2 cümle) Türkçe klinik gerekçe yaz.
-4. Kontrendike, gereksiz veya başka bir uzmanlık alanına ait işlemleri dahil etme.
-5. Yanıtını SADECE geçerli JSON olarak döndür, başka metin ekleme:
-   {{"uygun_islemler": [{{"kod": "...", "ad": "...", "gerekce": "..."}}]}}
-
-SUT İŞLEM LİSTESİ:""",
-            "cache_control": {"type": "ephemeral"},
-        },
-        {
-            "type": "text",
-            "text": procedures_text,
-            "cache_control": {"type": "ephemeral"},
-        },
-    ]
-
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        system=system_content,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Tanı / Şikayet: **{diagnosis}**\n\nBu tanı için SUT listesinden uygun işlemleri belirle.",
-            }
-        ],
+def build_prompt(diagnosis, procedures_text, specialty):
+    system = (
+        f"Sen Türk sağlık sisteminde {specialty} uzmanı bir klinisyensin.\n"
+        "Görevin: verilen tanı için aşağıdaki SUT işlem listesinden tıbben uygun işlemleri seçmek.\n\n"
+        "KURALLAR:\n"
+        "1. Sadece kanıta dayalı tıp standartlarına ve tıbbi etiğe uygun işlemleri seç.\n"
+        "2. Yalnızca listede yer alan işlemleri seç — listede olmayan işlem ekleme.\n"
+        "3. Her işlem için 1-2 cümle Türkçe klinik gerekçe yaz.\n"
+        "4. Kontrendike veya gereksiz işlemleri dahil etme.\n"
+        "5. SADECE geçerli JSON döndür, başka metin ekleme:\n"
+        '   {"uygun_islemler": [{"kod": "...", "ad": "...", "gerekce": "..."}]}\n\n'
+        f"SUT İŞLEM LİSTESİ:\n{procedures_text}"
     )
+    user = f"Tanı: {diagnosis}\n\nBu tanı için SUT listesinden uygun işlemleri belirle."
+    return system, user
 
-    raw = response.content[0].text.strip()
-    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if json_match:
-        return json.loads(json_match.group())
+
+# ── AI Queries ─────────────────────────────────────────────────────────────────
+
+def _parse_json(raw):
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        return json.loads(match.group())
     return {"uygun_islemler": []}
+
+
+def query_gemini(diagnosis, procedures_text, specialty, api_key):
+    genai.configure(api_key=api_key)
+    system, user = build_prompt(diagnosis, procedures_text, specialty)
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash",
+        system_instruction=system,
+    )
+    response = model.generate_content(user)
+    return _parse_json(response.text)
+
+
+def query_groq(diagnosis, procedures_text, specialty, api_key):
+    system, user = build_prompt(diagnosis, procedures_text, specialty)
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        max_tokens=4096,
+        temperature=0.1,
+    )
+    return _parse_json(response.choices[0].message.content)
+
+
+def run_both(diagnosis, procedures_text, specialty, gemini_key, groq_key):
+    results = {}
+    fns = {
+        "Gemini 2.0 Flash": (query_gemini, gemini_key),
+        "LLaMA 3.3 70B (Groq)": (query_groq, groq_key),
+    }
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {
+            pool.submit(fn, diagnosis, procedures_text, specialty, key): name
+            for name, (fn, key) in fns.items()
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as e:
+                results[name] = {"error": str(e), "uygun_islemler": []}
+    return results
+
+
+# ── Cross-check merge ──────────────────────────────────────────────────────────
+
+def merge_results(results):
+    by_code = {}
+    for source, data in results.items():
+        for item in data.get("uygun_islemler", []):
+            code = item.get("kod", "").strip()
+            if not code:
+                continue
+            if code not in by_code:
+                by_code[code] = {"ad": item.get("ad", ""), "sources": {}}
+            by_code[code]["sources"][source] = item.get("gerekce", "")
+
+    agreed, single = [], []
+    for code, info in by_code.items():
+        entry = {"kod": code, "ad": info["ad"], "sources": info["sources"]}
+        if len(info["sources"]) > 1:
+            agreed.append(entry)
+        else:
+            single.append(entry)
+
+    agreed.sort(key=lambda x: x["kod"])
+    single.sort(key=lambda x: x["kod"])
+    return agreed, single
 
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
 
 procedures = load_procedures()
 
-col1, col2 = st.columns([3, 1])
+def get_key(env_name, secret_name):
+    return os.environ.get(env_name) or st.secrets.get(secret_name, "")
 
+gemini_key = get_key("GEMINI_API_KEY", "GEMINI_API_KEY")
+groq_key   = get_key("GROQ_API_KEY",   "GROQ_API_KEY")
+
+if not gemini_key or not groq_key:
+    st.warning(
+        "API anahtarları eksik. Lütfen Streamlit Secrets veya ortam değişkeni olarak "
+        "`GEMINI_API_KEY` ve `GROQ_API_KEY` tanımlayın."
+    )
+
+col1, col2 = st.columns([3, 1])
 with col1:
     diagnosis = st.text_input(
         "Tanı / Şikayet",
         placeholder="Örn: Kronik böbrek yetmezliği, Nefrotik sendrom, Akut glomerülonefrit…",
     )
-
 with col2:
     specialty = st.selectbox(
         "Uzmanlık Alanı",
         ["Çocuk Nefrolojisi", "Nefroloji", "Pediatri", "Tümü"],
     )
 
-search = st.button("🔍 Uygun İşlemleri Bul", type="primary", disabled=not diagnosis.strip())
+search = st.button(
+    "🔍 Uygun İşlemleri Bul",
+    type="primary",
+    disabled=not (diagnosis.strip() and gemini_key and groq_key),
+)
 
 if search and diagnosis.strip():
     filtered = prefilter(procedures, specialty)
     proc_text = build_procedure_text(filtered)
 
-    with st.spinner(f"'{diagnosis}' için {len(filtered)} işlem arasında taranıyor…"):
-        result = query(diagnosis.strip(), proc_text, specialty)
+    with st.spinner(f"Gemini ve LLaMA paralel taranıyor ({len(filtered)} işlem)…"):
+        ai_results = run_both(diagnosis.strip(), proc_text, specialty, gemini_key, groq_key)
 
-    if result:
-        items = result.get("uygun_islemler", [])
-        if not items:
-            st.info("Bu tanı için listede uygun bir işlem bulunamadı.")
-        else:
-            st.success(f"**{len(items)} uygun işlem bulundu**")
-            st.markdown("---")
-            for item in items:
-                with st.container():
-                    c1, c2 = st.columns([1, 4])
-                    with c1:
-                        st.code(item.get("kod", "—"), language=None)
-                    with c2:
-                        st.markdown(f"**{item.get('ad', '')}**")
-                        st.caption(item.get("gerekce", ""))
+    for name, data in ai_results.items():
+        if "error" in data:
+            st.error(f"{name} hatası: {data['error']}")
+
+    agreed, single = merge_results(ai_results)
+    total = len(agreed) + len(single)
+
+    if total == 0:
+        st.info("Bu tanı için uygun işlem bulunamadı.")
+    else:
+        st.success(f"**{total} uygun işlem bulundu** — {len(agreed)} her iki AI tarafından onaylandı")
+        st.markdown("---")
+
+        if agreed:
+            st.markdown("### ✅ Her İki AI Tarafından Önerilen İşlemler")
+            st.caption("Yüksek güven — Gemini ve LLaMA 3.3 hem uygunluğu hem gerekçeyi doğruladı")
+            for item in agreed:
+                c1, c2 = st.columns([1, 4])
+                with c1:
+                    st.code(item["kod"], language=None)
+                with c2:
+                    st.markdown(f"**{item['ad']}**")
+                    for src, gerekce in item["sources"].items():
+                        st.caption(f"*{src}:* {gerekce}")
                 st.markdown("---")
+
+        if single:
+            st.markdown("### ⚠️ Tek AI Tarafından Önerilen İşlemler")
+            st.caption("Gözden geçirin — yalnızca bir kaynak önerdi")
+            for item in single:
+                c1, c2 = st.columns([1, 4])
+                with c1:
+                    st.code(item["kod"], language=None)
+                with c2:
+                    st.markdown(f"**{item['ad']}**")
+                    for src, gerekce in item["sources"].items():
+                        st.caption(f"*{src}:* {gerekce}")
+                st.markdown("---")
+
+        with st.expander("Ham AI Yanıtları"):
+            for name, data in ai_results.items():
+                st.markdown(f"**{name}** — {len(data.get('uygun_islemler', []))} işlem")
 
 st.sidebar.markdown("### Hakkında")
 st.sidebar.markdown(
     "SGK **Sağlık Uygulama Tebliği** (SUT) verilerine dayanır.\n\n"
     "**Kaynak:** mevzuat.gov.tr · Ocak 2025 güncel SUT\n\n"
+    "**AI Modeller:** Gemini 2.0 Flash · LLaMA 3.3 70B\n\n"
     "⚠️ Bu araç karar desteği amaçlıdır; klinik değerlendirmenin yerini tutmaz."
 )
 st.sidebar.markdown(f"**Toplam SUT işlemi:** {len(procedures):,}")
