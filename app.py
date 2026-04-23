@@ -21,7 +21,8 @@ st.caption("Tanıya göre SGK Sağlık Uygulama Tebliği kapsamındaki uygun iş
 
 @st.cache_data
 def load_procedures():
-    import pathlib
+    import pathlib, urllib.request
+    # Try local paths first, then fall back to GitHub raw URL
     candidates = [
         pathlib.Path(__file__).resolve().parent / "data" / "procedures.json",
         pathlib.Path("data/procedures.json"),
@@ -31,7 +32,10 @@ def load_procedures():
         if p.exists():
             with open(p, "r", encoding="utf-8") as f:
                 return json.load(f)
-    raise FileNotFoundError(f"procedures.json not found. Tried: {[str(p) for p in candidates]}")
+    # Download from GitHub if local file not found
+    url = "https://raw.githubusercontent.com/kguven24/sut-islem-asistani/main/data/procedures.json"
+    with urllib.request.urlopen(url) as r:
+        return json.loads(r.read().decode("utf-8"))
 
 
 SPECIALTY_KEYWORDS = {
