@@ -100,6 +100,7 @@ def build_prompt(diagnosis, procedures_text, specialty, compact=False):
         # Ultra-short for Groq free tier (<6k token budget)
         system = (
             f"{specialty} uzmanı. SUT listesinden tanıya uygun işlemleri seç. "
+            "Her gerekce max 8 kelime. "
             "Sadece JSON döndür: "
             '{"uygun_islemler":[{"kod":"...","ad":"...","gerekce":"..."}]}\n\n'
             f"SUT:\n{procedures_text}"
@@ -121,9 +122,19 @@ def build_prompt(diagnosis, procedures_text, specialty, compact=False):
 # ── AI Queries ─────────────────────────────────────────────────────────────────
 
 def _parse_json(raw):
+    # Try full JSON first
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if match:
-        return json.loads(match.group())
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+    # Fallback: extract individual procedure objects even from truncated JSON
+    items = []
+    for m in re.finditer(r'\{"kod"\s*:\s*"([^"]+)"\s*,\s*"ad"\s*:\s*"([^"]+)"\s*,\s*"gerekce"\s*:\s*"([^"]*)"', raw):
+        items.append({"kod": m.group(1), "ad": m.group(2), "gerekce": m.group(3)})
+    if items:
+        return {"uygun_islemler": items}
     return {"uygun_islemler": []}
 
 
