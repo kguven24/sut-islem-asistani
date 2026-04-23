@@ -21,9 +21,17 @@ st.caption("Tanıya göre SGK Sağlık Uygulama Tebliği kapsamındaki uygun iş
 
 @st.cache_data
 def load_procedures():
-    path = os.path.join(os.path.dirname(__file__), "data", "procedures.json")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    import pathlib
+    candidates = [
+        pathlib.Path(__file__).resolve().parent / "data" / "procedures.json",
+        pathlib.Path("data/procedures.json"),
+        pathlib.Path("/mount/src/sut-islem-asistani/data/procedures.json"),
+    ]
+    for p in candidates:
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+    raise FileNotFoundError(f"procedures.json not found. Tried: {[str(p) for p in candidates]}")
 
 
 SPECIALTY_KEYWORDS = {
